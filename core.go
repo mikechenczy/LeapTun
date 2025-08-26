@@ -229,7 +229,6 @@ func run(conn *websocket.Conn) {
 				var status struct {
 					Username           string `json:"username"`
 					RoomName           string `json:"roomName"`
-					RoomId             string `json:"roomId"`
 					IP                 string `json:"ip"`
 					RemainingBandwidth string `json:"remainingBandwidth"`
 					RoomMembers        []struct {
@@ -247,7 +246,7 @@ func run(conn *websocket.Conn) {
 				screen.MoveTopLeft()
 
 				fmt.Println("用户名:", status.Username)
-				fmt.Println("房间:", status.RoomName)
+				fmt.Println("房间名:", status.RoomName)
 				fmt.Println("当前 IP:", status.IP)
 				fmt.Println("房间剩余带宽:", status.RemainingBandwidth)
 				fmt.Println("成员列表:")

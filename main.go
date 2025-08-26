@@ -32,7 +32,7 @@ type Message struct {
 
 func main() {
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Println("欢迎使用LeapTUN")
+	fmt.Println("欢迎使用LeapTun")
 	fmt.Println("本程序开源无毒，请放心使用，开源地址：", source)
 	fmt.Println("客户端版本：", version)
 	fmt.Println("管理用户、房间、token，请前往：", website)
