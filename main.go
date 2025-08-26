@@ -145,7 +145,8 @@ func main() {
 
 			fmt.Println(resp["message"])
 			if code, ok := resp["code"].(float64); ok && code != 0 {
-				log.Println("[ERROR] Token 无效，程序退出")
+				log.Println("[ERROR] Token 无效，5s后程序退出")
+				time.Sleep(5 * time.Second)
 				os.Exit(0)
 			}
 
