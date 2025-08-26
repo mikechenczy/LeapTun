@@ -36,9 +36,16 @@ func main() {
 	fmt.Println("本程序开源无毒，请放心使用，开源地址：", source)
 	fmt.Println("客户端版本：", version)
 	fmt.Println("管理用户、房间、token，请前往：", website)
-	fmt.Print("请输入 token: ")
-	token, _ := reader.ReadString('\n')
-	token = strings.TrimSpace(token)
+	var token string
+	if len(os.Args) == 2 {
+		fmt.Print("读取到 token: ")
+		token = os.Args[1]
+		fmt.Println(token)
+	} else {
+		fmt.Print("请输入 token: ")
+		token, _ = reader.ReadString('\n')
+		token = strings.TrimSpace(token)
+	}
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -139,7 +146,7 @@ func main() {
 			fmt.Println(resp["message"])
 			if code, ok := resp["code"].(float64); ok && code != 0 {
 				log.Println("[ERROR] Token 无效，程序退出")
-				return
+				os.Exit(0)
 			}
 
 			// 调用核心逻辑 run(conn)，断开后自动重连
