@@ -84,7 +84,6 @@ func parseIPv4DstPort(pkt []byte) (dstIP string, dstPort int, proto string) {
 	case 1:
 		proto = "icmp"
 		dstPort = 0
-		log.Println("icmp: ", pkt)
 	case 6:
 		if len(pkt) < 24 {
 			return dstIP, 0, ""
