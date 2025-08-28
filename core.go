@@ -50,12 +50,22 @@ func setIPv4Addr(ipAddr string) error {
 			return fmt.Errorf("查找网卡失败: %v", err)
 		}
 
-		addrStr := fmt.Sprintf("%s/%s", ip, "24") // 例如 "10.0.0.4/24"
+		addrStr := fmt.Sprintf("%s/%s", ip, "24")
 		addr, err := netlink.ParseAddr(addrStr)
 		if err != nil {
 			return fmt.Errorf("解析地址失败: %v", err)
 		}
 
+		// 先清理旧的 IPv4 地址
+		addrs, err := netlink.AddrList(link, 2)
+		if err != nil {
+			return fmt.Errorf("获取旧地址失败: %v", err)
+		}
+		for _, a := range addrs {
+			_ = netlink.AddrDel(link, &a)
+		}
+
+		// 添加新的
 		if err := netlink.AddrAdd(link, addr); err != nil {
 			return fmt.Errorf("添加地址失败: %v", err)
 		}
@@ -63,6 +73,7 @@ func setIPv4Addr(ipAddr string) error {
 		if err := netlink.LinkSetUp(link); err != nil {
 			return fmt.Errorf("启动网卡失败: %v", err)
 		}
+
 		return nil
 	}
 }

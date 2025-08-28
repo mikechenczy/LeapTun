@@ -19,7 +19,7 @@ import (
 
 const (
 	server  = ""
-	version = "v1.0"
+	version = "v1.1"
 	website = "https://tun.mjczy.top/"
 	source  = "https://github.com/mikechenczy/LeapTun"
 	debug   = false
@@ -143,9 +143,9 @@ func main() {
 				continue
 			}
 
-			fmt.Println(resp["message"])
+			log.Println(resp["message"])
 			if code, ok := resp["code"].(float64); ok && code != 0 {
-				log.Println("[ERROR] Token 无效，5s后程序退出")
+				log.Println("[ERROR] 5s后程序退出")
 				time.Sleep(5 * time.Second)
 				os.Exit(0)
 			}
