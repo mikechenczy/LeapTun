@@ -22,7 +22,7 @@ const tunPacketOffset = 14
 
 var (
 	tunStarted = false
-	ip         = "10.0.0.0"
+	ip         = "10.0.0.2"
 	stop       = make(chan struct{})
 	stopOnce   sync.Once
 	devName    string
