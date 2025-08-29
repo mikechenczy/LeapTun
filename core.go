@@ -2,7 +2,7 @@ package main
 
 import (
 	"LeapTun/dll"
-	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"github.com/gorilla/websocket"
@@ -160,6 +160,13 @@ func run(conn *websocket.Conn) {
 	stop = make(chan struct{})
 	stopOnce = sync.Once{}
 
+	type packet struct {
+		dstIP string
+		data  []byte
+	}
+
+	sendQueue := make(chan packet, 1024)
+
 	// 上行 goroutine
 	wg.Add(1)
 	go func() {
@@ -177,38 +184,103 @@ func run(conn *websocket.Conn) {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			if n == 0 {
-				continue
-			}
 			for i := 0; i < n; i++ {
 				data := bufs[i][tunPacketOffset : tunPacketOffset+sizes[i]]
-				dstIP, dstPort, proto := parseIPv4DstPort(data)
+				dstIP, _, proto := parseIPv4DstPort(data)
 				if proto == "" || !isSameSubnet(dstIP, ip) || ip == dstIP {
 					continue
 				}
-				pkt := map[string]interface{}{
-					"srcIP":    ip,
-					"dstIP":    dstIP,
-					"protocol": proto,
-					"srcPort":  0,
-					"dstPort":  dstPort,
-					"payload":  base64.StdEncoding.EncodeToString(data),
-				}
-				message := map[string]interface{}{
-					"type": "pkt",
-					"data": pkt,
-				}
-				if err := conn.WriteJSON(message); err != nil {
-					log.Println("[ERROR] 发送失败:", err)
-					stopOnce.Do(func() { close(stop) })
-				} else if debug {
-					log.Printf("[DEBUG] %s:%s -> %s:%d, len=%d", pkt["srcIP"], pkt["protocol"], pkt["dstIP"], pkt["dstPort"], len(data))
+				// 放入队列（payload + IP）
+				p := packet{dstIP: dstIP, data: append([]byte(nil), data...)}
+				select {
+				case sendQueue <- p:
+				default:
+					<-sendQueue
+					sendQueue <- p
 				}
 			}
 		}
 	}()
 
-	// 下行循环
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		batchSizeBytes := 64 * 1024
+		flushInterval := 5 * time.Millisecond
+
+		var curIP string
+		var buf []byte
+		timer := time.NewTimer(flushInterval)
+		defer timer.Stop()
+
+		flush := func() {
+			if len(buf) > 0 && curIP != "" {
+				ipBytes := net.ParseIP(curIP).To4()
+				if ipBytes == nil {
+					buf = buf[:0]
+					curIP = ""
+					return
+				}
+
+				// 整帧格式: [1][dstIP(4)][buf...]
+				out := make([]byte, 1+4+len(buf))
+				out[0] = 1
+				copy(out[1:5], ipBytes)
+				copy(out[5:], buf)
+
+				if err := conn.WriteMessage(websocket.BinaryMessage, out); err != nil {
+					log.Println("[ERROR] 批量发送失败:", err)
+					stopOnce.Do(func() { close(stop) })
+				}
+				buf = buf[:0]
+				curIP = ""
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(flushInterval)
+		}
+
+		for {
+			select {
+			case <-stop:
+				flush()
+				log.Println("[INFO] 发送 goroutine 退出")
+				return
+			case p, ok := <-sendQueue:
+				if !ok {
+					flush()
+					log.Println("[INFO] 发送队列已关闭，退出发送 goroutine")
+					return
+				}
+				// 如果当前 IP 为空，初始化
+				if curIP == "" {
+					curIP = p.dstIP
+				}
+				// 如果 IP 不同，先 flush 再开启新批次
+				if curIP != p.dstIP {
+					flush()
+					curIP = p.dstIP
+				}
+				// 写入 [len|payload]
+				if len(buf)+2+len(p.data) > batchSizeBytes {
+					flush()
+					curIP = p.dstIP
+				}
+				tmp := make([]byte, 2+len(p.data))
+				binary.BigEndian.PutUint16(tmp[0:2], uint16(len(p.data)))
+				copy(tmp[2:], p.data)
+				buf = append(buf, tmp...)
+			case <-timer.C:
+				flush()
+			}
+		}
+	}()
+
+	// 下行循环（改为二进制格式）
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -219,81 +291,93 @@ func run(conn *websocket.Conn) {
 				return
 			default:
 			}
+
 			_, message, err := conn.ReadMessage()
 			if err != nil {
-				log.Println("读取消息失败:", err)
+				log.Println("[ERROR] 读取消息失败:", err)
 				stopOnce.Do(func() { close(stop) })
+				continue
 			}
 
-			var msg Message
-			if err := json.Unmarshal(message, &msg); err != nil {
-				log.Println("解析 JSON 失败:", err)
-				stopOnce.Do(func() { close(stop) })
+			if len(message) < 1 {
+				continue
 			}
 
-			switch msg.Type {
-			case "updateStatus":
-				var status struct {
-					Username           string `json:"username"`
-					RoomName           string `json:"roomName"`
-					IP                 string `json:"ip"`
-					RemainingBandwidth string `json:"remainingBandwidth"`
-					RoomMembers        []struct {
-						Name   string `json:"name"`
-						IP     string `json:"ip"`
-						Online bool   `json:"online"`
-					} `json:"roomMembers"`
-				}
-				if err := json.Unmarshal(msg.Data, &status); err != nil {
-					fmt.Println("解析 updateStatus 失败:", err)
+			msgType := message[0]
+			data := message[1:]
+
+			if msgType == 0 {
+				// JSON 消息
+				var msg Message
+				if err := json.Unmarshal(data, &msg); err != nil {
+					log.Println("[ERROR] 解析 JSON 失败:", err)
 					continue
 				}
 
-				screen.Clear()
-				screen.MoveTopLeft()
+				switch msg.Type {
+				case "updateStatus":
+					var status struct {
+						Username           string `json:"username"`
+						RoomName           string `json:"roomName"`
+						IP                 string `json:"ip"`
+						RemainingBandwidth string `json:"remainingBandwidth"`
+						RoomMembers        []struct {
+							Name   string `json:"name"`
+							IP     string `json:"ip"`
+							Online bool   `json:"online"`
+						} `json:"roomMembers"`
+					}
+					if err := json.Unmarshal(msg.Data, &status); err != nil {
+						log.Println("[ERROR] 解析 updateStatus 失败:", err)
+						continue
+					}
 
-				fmt.Println("用户名:", status.Username)
-				fmt.Println("房间名:", status.RoomName)
-				fmt.Println("当前 IP:", status.IP)
-				fmt.Println("房间剩余带宽:", status.RemainingBandwidth)
-				fmt.Println("成员列表:")
-				for _, m := range status.RoomMembers {
-					if m.Online {
-						fmt.Printf(" - %s %s (%s)\n", m.Name, m.IP, "在线")
-					} else {
-						fmt.Printf(" - %s %s (%s)\n", m.Name, m.IP, "离线")
+					screen.Clear()
+					screen.MoveTopLeft()
+					fmt.Println("用户名:", status.Username)
+					fmt.Println("房间名:", status.RoomName)
+					fmt.Println("当前 IP:", status.IP)
+					fmt.Println("房间剩余带宽:", status.RemainingBandwidth)
+					fmt.Println("成员列表:")
+					for _, m := range status.RoomMembers {
+						if m.Online {
+							fmt.Printf(" - %s %s (%s)\n", m.Name, m.IP, "在线")
+						} else {
+							fmt.Printf(" - %s %s (%s)\n", m.Name, m.IP, "离线")
+						}
+					}
+
+					if ip != status.IP {
+						if err := setIPv4Addr(status.IP); err != nil {
+							log.Println("[ERROR] 设置IP失败:", err)
+						}
 					}
 				}
-				if ip != status.IP {
-					err := setIPv4Addr(status.IP)
-					if err != nil {
-						fmt.Println("设置IP失败: ", err)
-					}
-				}
-			case "pkt":
-				var packet struct {
-					SrcIP    string `json:"srcIP"`
-					DstIP    string `json:"dstIP"`
-					Protocol string `json:"protocol"`
-					SrcPort  int    `json:"srcPort"`
-					DstPort  int    `json:"dstPort"`
-					Payload  []byte `json:"payload"`
-				}
-				if err := json.Unmarshal(msg.Data, &packet); err != nil {
-					fmt.Println("解析 packet 失败:", err)
+			} else {
+				if len(data) < 4 {
 					continue
 				}
+				dstIP := net.IP(data[0:4]).String()
+				buf := data[4:]
 
-				//log.Printf("写入 TUN, len=%d, IP头=%x %x %x %x ...", len(pkt.Payload), pkt.Payload[0], pkt.Payload[1], pkt.Payload[2], pkt.Payload[3])
-				buf := make([]byte, tunPacketOffset+len(packet.Payload))
-				copy(buf[tunPacketOffset:], packet.Payload)
-				_, err := dev.Write([][]byte{buf}, tunPacketOffset)
-				if debug {
-					if err != nil {
+				for len(buf) >= 2 {
+					plen := int(binary.BigEndian.Uint16(buf[0:2]))
+					if plen < 0 || len(buf) < 2+plen {
+						log.Println("[WARN] 下行包长度异常，丢弃剩余数据")
+						break
+					}
+					payload := buf[2 : 2+plen]
+
+					out := make([]byte, tunPacketOffset+plen)
+					copy(out[tunPacketOffset:], payload)
+
+					if _, err := dev.Write([][]byte{out}, tunPacketOffset); err != nil {
 						log.Println("[ERROR] 写入 TUN 失败:", err)
-					} else {
-						log.Printf("[DEBUG] 写入 TUN, len=%d", len(packet.Payload))
+					} else if debug {
+						log.Printf("[DEBUG] 写入 TUN, len=%d, dst=%s", plen, dstIP)
 					}
+
+					buf = buf[2+plen:]
 				}
 			}
 		}
@@ -303,5 +387,6 @@ func run(conn *websocket.Conn) {
 	wg.Wait()
 	ip = ""
 	tunStarted = false
+	close(sendQueue)
 	log.Println("[INFO] run() 已退出")
 }
