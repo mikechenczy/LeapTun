@@ -78,39 +78,18 @@ func setIPv4Addr(ipAddr string) error {
 	}
 }
 
-func parseIPv4DstPort(pkt []byte) (dstIP string, dstPort int, proto string) {
+func getDstIP(pkt []byte) (dstIP string) {
 	if len(pkt) < 20 {
-		return "", 0, ""
+		return ""
 	}
 	if pkt[0]>>4 != 4 {
-		return "", 0, ""
+		return ""
 	}
 	ipDst := net.IP(pkt[16:20]).To4()
 	if ipDst == nil {
-		return "", 0, ""
+		return ""
 	}
-	protocol := pkt[9]
-	dstIP = ipDst.String()
-	switch protocol {
-	case 1:
-		proto = "icmp"
-		dstPort = 0
-	case 6:
-		if len(pkt) < 24 {
-			return dstIP, 0, ""
-		}
-		dstPort = int(pkt[22])<<8 | int(pkt[23])
-		proto = "tcp"
-	case 17:
-		if len(pkt) < 24 {
-			return dstIP, 0, ""
-		}
-		dstPort = int(pkt[22])<<8 | int(pkt[23])
-		proto = "udp"
-	default:
-		proto = ""
-	}
-	return
+	return ipDst.String()
 }
 
 func isSameSubnet(ip1Str, ip2Str string) bool {
@@ -153,7 +132,7 @@ func run(conn *websocket.Conn) {
 	bufs := make([][]byte, batch)
 	sizes := make([]int, batch)
 	for i := range bufs {
-		bufs[i] = make([]byte, 1<<16)
+		bufs[i] = make([]byte, 1500)
 	}
 
 	var wg sync.WaitGroup
@@ -186,8 +165,8 @@ func run(conn *websocket.Conn) {
 			}
 			for i := 0; i < n; i++ {
 				data := bufs[i][tunPacketOffset : tunPacketOffset+sizes[i]]
-				dstIP, _, proto := parseIPv4DstPort(data)
-				if proto == "" || !isSameSubnet(dstIP, ip) || ip == dstIP {
+				dstIP := getDstIP(data)
+				if ip == "" || !isSameSubnet(dstIP, ip) || ip == dstIP {
 					continue
 				}
 				// 放入队列（payload + IP）
