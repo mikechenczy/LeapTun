@@ -19,7 +19,7 @@ import (
 
 const (
 	server  = ""
-	version = "v1.1"
+	version = "v1.2"
 	website = "https://tun.mjczy.top/"
 	source  = "https://github.com/mikechenczy/LeapTun"
 	debug   = false

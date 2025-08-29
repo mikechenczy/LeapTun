@@ -113,21 +113,18 @@ func parseIPv4DstPort(pkt []byte) (dstIP string, dstPort int, proto string) {
 	return
 }
 
-func isPrivate24(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
+func isSameSubnet(ip1Str, ip2Str string) bool {
+	ip1 := net.ParseIP(ip1Str).To4()
+	ip2 := net.ParseIP(ip2Str).To4()
+	if ip1 == nil || ip2 == nil {
 		return false
 	}
-	if ip[12] == 10 {
-		return true
-	}
-	if ip[12] == 172 && ip[13] == 16 {
-		return true
-	}
-	if ip[12] == 192 && ip[13] == 168 {
-		return true
-	}
-	return false
+
+	mask := net.CIDRMask(24, 32) // /24
+	network1 := ip1.Mask(mask)
+	network2 := ip2.Mask(mask)
+
+	return network1.Equal(network2)
 }
 
 func run(conn *websocket.Conn) {
@@ -186,7 +183,7 @@ func run(conn *websocket.Conn) {
 			for i := 0; i < n; i++ {
 				data := bufs[i][tunPacketOffset : tunPacketOffset+sizes[i]]
 				dstIP, dstPort, proto := parseIPv4DstPort(data)
-				if proto == "" || !isPrivate24(dstIP) || ip == dstIP {
+				if proto == "" || !isSameSubnet(dstIP, ip) || ip == dstIP {
 					continue
 				}
 				pkt := map[string]interface{}{
