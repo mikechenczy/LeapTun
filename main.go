@@ -19,11 +19,13 @@ import (
 
 const (
 	server  = ""
-	version = "v1.2"
+	version = "v1.3"
 	website = "https://tun.mjczy.top/"
 	source  = "https://github.com/mikechenczy/LeapTun"
 	debug   = false
 )
+
+var token string
 
 type Message struct {
 	Type string          `json:"type"`
@@ -36,7 +38,6 @@ func main() {
 	fmt.Println("本程序开源无毒，请放心使用，开源地址：", source)
 	fmt.Println("客户端版本：", version)
 	fmt.Println("管理用户、房间、token，请前往：", website)
-	var token string
 	if len(os.Args) == 2 {
 		fmt.Print("读取到 token: ")
 		token = os.Args[1]
