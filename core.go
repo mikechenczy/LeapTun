@@ -4,7 +4,6 @@ import (
 	"LeapTun/dll"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"github.com/inancgumus/screen"
@@ -95,162 +94,6 @@ func getDstIP(pkt []byte) (dstIP string) {
 		return ""
 	}
 	return ipDst.String()
-}
-
-// 判断是否是 ACK 包
-func isPureAck(packet []byte) (bool, error) {
-	// IPv4 header 最小 20 字节
-	if len(packet) < 20 {
-		return false, errors.New("packet too short for IPv4 header")
-	}
-
-	ipHeaderLen := int((packet[0] & 0x0F) * 4)
-	if len(packet) < ipHeaderLen+20 {
-		return false, errors.New("packet too short for TCP header")
-	}
-
-	// 确认协议号是不是 TCP
-	proto := packet[9]
-	if proto != IPProtoTCP {
-		return false, nil
-	}
-
-	// TCP Header 起始位置
-	tcp := packet[ipHeaderLen:]
-	flags := tcp[13]
-	tcpHdrLen := int((tcp[12] >> 4) * 4)
-
-	ack := flags&0x10 != 0
-	syn := flags&0x02 != 0
-	fin := flags&0x01 != 0
-	rst := flags&0x04 != 0
-
-	// 是否有 payload
-	payloadLen := len(packet) - ipHeaderLen - tcpHdrLen
-
-	// 纯 ACK：必须有 ACK，没有 payload，且不能带 SYN/FIN/RST
-	return ack && !syn && !fin && !rst && payloadLen == 0, nil
-}
-
-// 判断是否需要 ACK 包（即：对端发来数据了，必须回复 ACK）
-func needAck(packet []byte) (bool, error) {
-	if len(packet) < 20 {
-		return false, errors.New("packet too short for IPv4 header")
-	}
-	ipHeaderLen := int((packet[0] & 0x0F) * 4)
-	if len(packet) < ipHeaderLen+20 {
-		return false, errors.New("packet too short for TCP header")
-	}
-
-	proto := packet[9]
-	if proto != IPProtoTCP {
-		return false, nil
-	}
-
-	tcp := packet[ipHeaderLen:]
-	dataOffset := int((tcp[12] >> 4) * 4)
-	if len(tcp) < dataOffset {
-		return false, errors.New("invalid tcp header")
-	}
-
-	// TCP payload 是否存在
-	payloadLen := len(packet) - ipHeaderLen - dataOffset
-	return payloadLen > 0, nil
-}
-
-// 计算 16bit 的反码和校验
-func checksum(data []byte) uint16 {
-	var sum uint32
-	length := len(data)
-	for i := 0; i < length-1; i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(data[i:]))
-	}
-	if length%2 == 1 {
-		sum += uint32(data[length-1]) << 8
-	}
-	for (sum >> 16) > 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	return ^uint16(sum)
-}
-
-// 重算 IP header checksum
-func fixIPChecksum(ipHeader []byte) {
-	ipHeader[10], ipHeader[11] = 0, 0 // 清零
-	cs := checksum(ipHeader)
-	binary.BigEndian.PutUint16(ipHeader[10:], cs)
-}
-
-// 重算 TCP checksum（含伪首部）
-func fixTCPChecksum(ipHeader, tcpSegment []byte) {
-	tcpSegment[16], tcpSegment[17] = 0, 0 // 清零
-
-	psHeader := make([]byte, 12+len(tcpSegment))
-	copy(psHeader[0:4], ipHeader[12:16]) // src ip
-	copy(psHeader[4:8], ipHeader[16:20]) // dst ip
-	psHeader[8] = 0
-	psHeader[9] = IPProtoTCP
-	binary.BigEndian.PutUint16(psHeader[10:12], uint16(len(tcpSegment)))
-	copy(psHeader[12:], tcpSegment)
-
-	cs := checksum(psHeader)
-	binary.BigEndian.PutUint16(tcpSegment[16:], cs)
-}
-
-// 生成 ACK 包
-func makeAckPacket(packet []byte) ([]byte, error) {
-	if len(packet) < 20 {
-		return nil, errors.New("packet too short for IPv4 header")
-	}
-	ipHeaderLen := int((packet[0] & 0x0F) * 4)
-	if len(packet) < ipHeaderLen+20 {
-		return nil, errors.New("packet too short for TCP header")
-	}
-	tcp := packet[ipHeaderLen:]
-
-	dataOffset := int((tcp[12] >> 4) * 4)
-	if len(tcp) < dataOffset {
-		return nil, errors.New("invalid tcp header")
-	}
-
-	payloadLen := len(packet) - ipHeaderLen - dataOffset
-
-	// 提取 seq 和 ack
-	seq := binary.BigEndian.Uint32(tcp[4:8])
-	ack := binary.BigEndian.Uint32(tcp[8:12])
-
-	// 新建一个 ACK 包（只保留 IP+TCP header，payload 去掉）
-	ackPkt := make([]byte, ipHeaderLen+dataOffset)
-	copy(ackPkt, packet[:ipHeaderLen+dataOffset])
-
-	// 交换 IP src/dst
-	copy(ackPkt[12:16], packet[16:20]) // src = 原 dst
-	copy(ackPkt[16:20], packet[12:16]) // dst = 原 src
-
-	// TCP 部分
-	tcpAck := ackPkt[ipHeaderLen:]
-
-	// src/dst 端口交换
-	copy(tcpAck[0:2], tcp[2:4])
-	copy(tcpAck[2:4], tcp[0:2])
-
-	// seq = 原来的 ack
-	binary.BigEndian.PutUint32(tcpAck[4:8], ack)
-	// ack = 原来的 seq + payloadLen
-	binary.BigEndian.PutUint32(tcpAck[8:12], seq+uint32(payloadLen))
-
-	// flags = ACK
-	tcpAck[13] = 0x10
-
-	// TCP payload 长度=0
-	totalLen := ipHeaderLen + dataOffset
-	binary.BigEndian.PutUint16(ackPkt[2:4], uint16(totalLen))
-
-	// 重算校验和
-	fixIPChecksum(ackPkt[:ipHeaderLen])
-	fixTCPChecksum(ackPkt[:ipHeaderLen], tcpAck)
-
-	return ackPkt, nil
 }
 
 func isSameSubnet(ip1Str, ip2Str string) bool {
@@ -706,7 +549,6 @@ func run(wsConn *websocket.Conn) {
 				data = data[4:]
 				id := decodeEndpointID(data)
 				localConn, ok := cmClient.Get(*id)
-				log.Println(len(cmClient.conns))
 				if ok {
 					if debug {
 						log.Println("存在conn继续write")
@@ -718,9 +560,9 @@ func run(wsConn *websocket.Conn) {
 					}
 				} else {
 					if debug {
-						log.Println("dial: " + "127.0.0.1:" + fmt.Sprintf("%d", id.LocalPort))
+						log.Println("dial: " + ip + ":" + fmt.Sprintf("%d", id.LocalPort))
 					}
-					localConn, err = net.Dial("tcp", "127.0.0.1:"+fmt.Sprintf("%d", id.LocalPort))
+					localConn, err = net.Dial("tcp", ip+":"+fmt.Sprintf("%d", id.LocalPort))
 					if err != nil {
 						log.Println("dial err:", err)
 						continue
