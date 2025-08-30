@@ -717,7 +717,9 @@ func run(wsConn *websocket.Conn) {
 						continue
 					}
 				} else {
-					log.Println("dial: " + "127.0.0.1:" + fmt.Sprintf("%d", id.LocalPort))
+					if debug {
+						log.Println("dial: " + "127.0.0.1:" + fmt.Sprintf("%d", id.LocalPort))
+					}
 					localConn, err = net.Dial("tcp", "127.0.0.1:"+fmt.Sprintf("%d", id.LocalPort))
 					if err != nil {
 						log.Println("dial err:", err)
