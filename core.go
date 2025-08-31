@@ -27,9 +27,11 @@ var (
 	tunStarted = false
 	ip         = "10.0.0.0"
 	stop       = make(chan struct{})
+	wg         sync.WaitGroup
 	stopOnce   sync.Once
 	devName    string
 	dev        tun.Device
+	c          *Convertor
 )
 
 func setIPv4Addr(ipAddr string) error {
@@ -169,7 +171,7 @@ func decodeEndpointID(b []byte) *stack.TransportEndpointID {
 }
 
 var allClosed bool
-var closeLocker = sync.Mutex{}
+var closeLocker sync.Mutex
 
 func closeAll(conn *websocket.Conn) {
 	closeLocker.Lock()
@@ -178,8 +180,9 @@ func closeAll(conn *websocket.Conn) {
 		return
 	}
 	allClosed = true
-	dev.Close()
-	conn.Close()
+	c.Close()
+	_ = dev.Close()
+	_ = conn.Close()
 }
 
 func run(wsConn *websocket.Conn) {
@@ -211,18 +214,19 @@ func run(wsConn *websocket.Conn) {
 		bufs[i] = make([]byte, 1500)
 	}
 
-	var wg sync.WaitGroup
+	wg = sync.WaitGroup{}
 	stop = make(chan struct{})
 	stopOnce = sync.Once{}
+	wsOnce = sync.Once{}
 
 	type packet struct {
 		dstIP string
 		data  []byte
 	}
 
-	sendQueue := make(chan packet, 1024)
+	sendQueue := make(chan packet, 1<<14)
 
-	c := NewConvertor(WriteBytes)
+	c = NewConvertor(WriteBytesToTun)
 
 	c.StartTCPForwarder(func(newConn net.Conn, id *stack.TransportEndpointID) {
 		if debug {
@@ -241,7 +245,6 @@ func run(wsConn *websocket.Conn) {
 					cmServer.Delete(*id)
 					newConn.Close()
 					log.Println("[INFO] TCP Forwarder goroutine 退出")
-					c.Close()
 					closeAll(wsConn)
 					return
 				default:
@@ -254,10 +257,7 @@ func run(wsConn *websocket.Conn) {
 					copy(serverData[9:13], id.RemoteAddress.AsSlice())
 					binary.BigEndian.PutUint16(serverData[13:15], id.LocalPort)
 					binary.BigEndian.PutUint16(serverData[15:17], id.RemotePort)
-					if err := SafeWriteMessage(wsConn, websocket.BinaryMessage, serverData); err != nil {
-						log.Println("[ERROR] 发送失败:", err)
-						stopOnce.Do(func() { close(stop) })
-					}
+					writeMessageAsync(wsConn, websocket.BinaryMessage, serverData)
 					return
 				}
 				n, err := newConn.Read(buf)
@@ -282,10 +282,7 @@ func run(wsConn *websocket.Conn) {
 				binary.BigEndian.PutUint16(serverData[15:17], id.RemotePort)
 				copy(serverData[17:], data)
 
-				if err := SafeWriteMessage(wsConn, websocket.BinaryMessage, serverData); err != nil {
-					log.Println("[ERROR] 发送失败:", err)
-					stopOnce.Do(func() { close(stop) })
-				}
+				writeMessageAsync(wsConn, websocket.BinaryMessage, serverData)
 			}
 		}()
 	})
@@ -298,7 +295,6 @@ func run(wsConn *websocket.Conn) {
 			select {
 			case <-stop:
 				log.Println("[INFO] 上行 goroutine 退出")
-				c.Close()
 				closeAll(wsConn)
 				return
 			default:
@@ -321,30 +317,6 @@ func run(wsConn *websocket.Conn) {
 				if ip == "" || !isSameSubnet(dstIP, ip) || ip == dstIP {
 					continue
 				}
-				// 放入队列（payload + IP）
-				//log.Println(len(data))
-				//a, _ := isPureAck(data)
-				//log.Println(a)
-				//if a {
-				//continue
-				//}
-				//a, _ = needAck(data)
-				//log.Println(a)
-				//if a {
-				/*fakeAck, _ := makeAckPacket(data)
-				go func() {
-					time.Sleep(40*time.Millisecond)
-					out := make([]byte, tunPacketOffset+len(fakeAck))
-					copy(out[tunPacketOffset:], fakeAck)
-
-					if _, err := dev.Write([][]byte{out}, tunPacketOffset); err != nil {
-						log.Println("[ERROR] 写入 TUN 失败:", err)
-					} else if debug {
-						log.Printf("[DEBUG] 写入 Fake ACK, len=%d, dst=%s", len(fakeAck), dstIP)
-					}
-				}()*/
-				//}
-
 				if len(data) > 9 && data[9] == IPProtoTCP {
 					c.SendBytes(data)
 					continue
@@ -381,15 +353,12 @@ func run(wsConn *websocket.Conn) {
 				}
 
 				// 整帧格式: [1][dstIP(4)][buf...]
-				out := make([]byte, 1+4+len(buf))
+				out := make([]byte, 5+len(buf))
 				out[0] = 1
 				copy(out[1:5], ipBytes)
 				copy(out[5:], buf)
 
-				if err := SafeWriteMessage(wsConn, websocket.BinaryMessage, out); err != nil {
-					log.Println("[ERROR] 批量发送失败:", err)
-					stopOnce.Do(func() { close(stop) })
-				}
+				writeMessageAsync(wsConn, websocket.BinaryMessage, out)
 				buf = buf[:0]
 				curIP = ""
 			}
@@ -407,7 +376,6 @@ func run(wsConn *websocket.Conn) {
 			case <-stop:
 				flush()
 				log.Println("[INFO] 发送 goroutine 退出")
-				c.Close()
 				closeAll(wsConn)
 				return
 			case p, ok := <-sendQueue:
@@ -448,7 +416,6 @@ func run(wsConn *websocket.Conn) {
 			select {
 			case <-stop:
 				log.Println("[INFO] 下行 goroutine 退出")
-				c.Close()
 				closeAll(wsConn)
 				return
 			default:
@@ -459,7 +426,6 @@ func run(wsConn *websocket.Conn) {
 				select {
 				case <-stop:
 					log.Println("[INFO] 下行 goroutine 退出")
-					c.Close()
 					closeAll(wsConn)
 					return
 				default:
@@ -502,8 +468,10 @@ func run(wsConn *websocket.Conn) {
 						continue
 					}
 
-					screen.Clear()
-					screen.MoveTopLeft()
+					if !debug {
+						screen.Clear()
+						screen.MoveTopLeft()
+					}
 					fmt.Println("用户名:", status.Username)
 					fmt.Println("房间名:", status.RoomName)
 					fmt.Println("当前 IP:", status.IP)
@@ -538,7 +506,7 @@ func run(wsConn *websocket.Conn) {
 					}
 					payload := buf[2 : 2+plen]
 
-					WriteBytesWithLen(payload, plen)
+					WriteBytesWithLenToTun(payload, plen)
 
 					buf = buf[2+plen:]
 				}
@@ -584,7 +552,6 @@ func run(wsConn *websocket.Conn) {
 								cmClient.Delete(*id)
 								localConn.Close()
 								log.Println("[INFO] TCP Forwarder goroutine 退出")
-								c.Close()
 								closeAll(wsConn)
 								return
 							default:
@@ -597,10 +564,7 @@ func run(wsConn *websocket.Conn) {
 								copy(serverData[9:13], id.RemoteAddress.AsSlice())
 								binary.BigEndian.PutUint16(serverData[13:15], id.LocalPort)
 								binary.BigEndian.PutUint16(serverData[15:17], id.RemotePort)
-								if err := SafeWriteMessage(wsConn, websocket.BinaryMessage, serverData); err != nil {
-									log.Println("[ERROR] 发送失败:", err)
-									stopOnce.Do(func() { close(stop) })
-								}
+								writeMessageAsync(wsConn, websocket.BinaryMessage, serverData)
 								return
 							}
 							n, err := localConn.Read(buf)
@@ -627,11 +591,7 @@ func run(wsConn *websocket.Conn) {
 							binary.BigEndian.PutUint16(serverData[13:15], id.LocalPort)
 							binary.BigEndian.PutUint16(serverData[15:17], id.RemotePort)
 							copy(serverData[17:], data)
-
-							if err := SafeWriteMessage(wsConn, websocket.BinaryMessage, serverData); err != nil {
-								log.Println("[ERROR] 发送失败:", err)
-								stopOnce.Do(func() { close(stop) })
-							}
+							writeMessageAsync(wsConn, websocket.BinaryMessage, serverData)
 						}
 					}()
 				}
@@ -661,10 +621,7 @@ func run(wsConn *websocket.Conn) {
 							copy(serverData[9:13], id.RemoteAddress.AsSlice())
 							binary.BigEndian.PutUint16(serverData[13:15], id.LocalPort)
 							binary.BigEndian.PutUint16(serverData[15:17], id.RemotePort)
-							if err := SafeWriteMessage(wsConn, websocket.BinaryMessage, serverData); err != nil {
-								log.Println("[ERROR] 发送失败:", err)
-								stopOnce.Do(func() { close(stop) })
-							}
+							writeMessageAsync(wsConn, websocket.BinaryMessage, serverData)
 						}
 					}()
 				}
@@ -755,21 +712,76 @@ func run(wsConn *websocket.Conn) {
 	wg.Wait()
 	ip = ""
 	tunStarted = false
-	c.Close()
+
 	closeAll(wsConn)
 	close(sendQueue)
 	log.Println("[INFO] run() 已退出")
 }
 
-var wsMu sync.Mutex
-
-func SafeWriteMessage(conn *websocket.Conn, msgType int, data []byte) error {
-	wsMu.Lock()
-	defer wsMu.Unlock()
-	return conn.WriteMessage(msgType, data)
+type msg struct {
+	typ  int
+	data []byte
 }
 
-func WriteBytes(payload []byte) (int, error) {
+var (
+	wsWriteQueue chan msg
+	wsOnce       sync.Once
+)
+
+func initWriter(wsConn *websocket.Conn) {
+	wsWriteQueue = make(chan msg, 1024)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				log.Println("[INFO] 异步发送 goroutine 退出")
+				closeAll(wsConn)
+				return
+			case m := <-wsWriteQueue:
+				_ = wsConn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := wsConn.WriteMessage(m.typ, m.data); err != nil {
+					select {
+					case <-stop:
+						log.Println("[INFO] 异步发送 goroutine 退出")
+						closeAll(wsConn)
+						return
+					default:
+					}
+					log.Println("[ERROR] 发送失败:", err)
+					stopOnce.Do(func() { close(stop) })
+					return
+				}
+			}
+		}
+	}()
+}
+
+func writeMessageAsync(wsConn *websocket.Conn, messageType int, data []byte) {
+	/*wg.Add(1)
+	go func() {
+		defer wg.Done()
+		wsMu.Lock()
+		defer wsMu.Unlock()
+		if err := wsConn.WriteMessage(messageType, data); err != nil {
+			select {
+			case <-stop:
+				log.Println("[INFO] 异步发送 goroutine 退出")
+				closeAll(wsConn)
+				return
+			default:
+			}
+			log.Println("[ERROR] 发送失败:", err)
+			stopOnce.Do(func() { close(stop) })
+		}
+	}()*/
+	wsOnce.Do(func() { initWriter(wsConn) })
+	wsWriteQueue <- msg{typ: messageType, data: data}
+}
+
+func WriteBytesToTun(payload []byte) (int, error) {
 	plen := len(payload)
 	out := make([]byte, tunPacketOffset+plen)
 	copy(out[tunPacketOffset:], payload)
@@ -777,7 +789,7 @@ func WriteBytes(payload []byte) (int, error) {
 	return dev.Write([][]byte{out}, tunPacketOffset)
 }
 
-func WriteBytesWithLen(payload []byte, plen int) {
+func WriteBytesWithLenToTun(payload []byte, plen int) {
 	out := make([]byte, tunPacketOffset+plen)
 	copy(out[tunPacketOffset:], payload)
 
