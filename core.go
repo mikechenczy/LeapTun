@@ -752,7 +752,6 @@ func initWriter(wsConn *websocket.Conn) {
 					}
 					log.Println("[ERROR] 发送失败:", err)
 					stopOnce.Do(func() { close(stop) })
-					return
 				}
 			}
 		}
