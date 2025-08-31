@@ -183,6 +183,30 @@ func closeAll(conn *websocket.Conn) {
 	c.Close()
 	_ = dev.Close()
 	_ = conn.Close()
+	for _, id := range cmClient.Keys() {
+		conn, ok := cmClient.Get(id)
+		if !ok {
+			continue
+		}
+		cmClient.Delete(id)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = conn.Close()
+		}()
+	}
+	for _, id := range cmServer.Keys() {
+		conn, ok := cmServer.Get(id)
+		if !ok {
+			continue
+		}
+		cmServer.Delete(id)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = conn.Close()
+		}()
+	}
 }
 
 func run(wsConn *websocket.Conn) {
@@ -712,7 +736,6 @@ func run(wsConn *websocket.Conn) {
 	wg.Wait()
 	ip = ""
 	tunStarted = false
-
 	closeAll(wsConn)
 	close(sendQueue)
 	log.Println("[INFO] run() 已退出")
