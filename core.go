@@ -21,7 +21,7 @@ import (
 )
 
 const tunPacketOffset = 14
-const IPProtoTCP = 6
+const maxLimit = 1 << 23
 
 var (
 	tunStarted = false
@@ -113,45 +113,45 @@ func isSameSubnet(ip1Str, ip2Str string) bool {
 }
 
 type ConnMap struct {
-	mu    sync.Mutex
-	conns map[stack.TransportEndpointID]net.Conn
+	mu          sync.Mutex
+	connWriters map[stack.TransportEndpointID]*ConnHandler
 }
 
-func (cm *ConnMap) Set(id stack.TransportEndpointID, conn net.Conn) {
+func (cm *ConnMap) Set(id stack.TransportEndpointID, connWriter *ConnHandler) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	cm.conns[id] = conn
+	cm.connWriters[id] = connWriter
 }
 
-func (cm *ConnMap) Get(id stack.TransportEndpointID) (net.Conn, bool) {
+func (cm *ConnMap) Get(id stack.TransportEndpointID) (*ConnHandler, bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	c, ok := cm.conns[id]
+	c, ok := cm.connWriters[id]
 	return c, ok
 }
 
 func (cm *ConnMap) Delete(id stack.TransportEndpointID) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	delete(cm.conns, id)
+	delete(cm.connWriters, id)
 }
 
 func (cm *ConnMap) Keys() []stack.TransportEndpointID {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	keys := make([]stack.TransportEndpointID, 0, len(cm.conns))
-	for k := range cm.conns {
+	keys := make([]stack.TransportEndpointID, 0, len(cm.connWriters))
+	for k := range cm.connWriters {
 		keys = append(keys, k)
 	}
 	return keys
 }
 
 var cmServer = &ConnMap{
-	conns: make(map[stack.TransportEndpointID]net.Conn),
+	connWriters: make(map[stack.TransportEndpointID]*ConnHandler),
 }
 
 var cmClient = &ConnMap{
-	conns: make(map[stack.TransportEndpointID]net.Conn),
+	connWriters: make(map[stack.TransportEndpointID]*ConnHandler),
 }
 
 func decodeEndpointID(b []byte) *stack.TransportEndpointID {
@@ -183,6 +183,7 @@ func closeAll(conn *websocket.Conn) {
 	c.Close()
 	_ = dev.Close()
 	_ = conn.Close()
+	close(wsWriteQueue)
 	for _, id := range cmClient.Keys() {
 		conn, ok := cmClient.Get(id)
 		if !ok {
@@ -252,12 +253,34 @@ func run(wsConn *websocket.Conn) {
 
 	c = NewConvertor(WriteBytesToTun)
 
-	c.StartTCPForwarder(func(newConn net.Conn, id *stack.TransportEndpointID) {
+	c.StartTCPForwarder(func(tunConn net.Conn, id *stack.TransportEndpointID) {
 		if debug {
 			log.Println("拿到连接了！！！")
 			log.Println(id.LocalAddress)
+			log.Println("cmServer count: ", len(cmServer.Keys()))
 		}
-		cmServer.Set(*id, newConn)
+		tunConnHandler := NewConnHandler(tunConn, 1<<14, 0, 0, func(cw *ConnHandler, n int, err error) {
+			if err != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if debug {
+						log.Println("数据写入失败")
+					}
+					cmServer.Delete(*id)
+					_ = cw.Close()
+					serverData := make([]byte, 17)
+					serverData[0] = 4
+					copy(serverData[1:5], id.LocalAddress.AsSlice())
+					copy(serverData[5:9], id.LocalAddress.AsSlice())
+					copy(serverData[9:13], id.RemoteAddress.AsSlice())
+					binary.BigEndian.PutUint16(serverData[13:15], id.LocalPort)
+					binary.BigEndian.PutUint16(serverData[15:17], id.RemotePort)
+					writeMessageAsync(wsConn, websocket.BinaryMessage, serverData)
+				}()
+			}
+		})
+		cmServer.Set(*id, tunConnHandler)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -267,7 +290,7 @@ func run(wsConn *websocket.Conn) {
 				select {
 				case <-stop:
 					cmServer.Delete(*id)
-					newConn.Close()
+					_ = tunConnHandler.Close()
 					log.Println("[INFO] TCP Forwarder goroutine 退出")
 					closeAll(wsConn)
 					return
@@ -284,13 +307,13 @@ func run(wsConn *websocket.Conn) {
 					writeMessageAsync(wsConn, websocket.BinaryMessage, serverData)
 					return
 				}
-				n, err := newConn.Read(buf)
+				n, err := tunConnHandler.conn.Read(buf)
 				if err != nil {
 					if debug {
 						log.Println("Read error:", err)
 					}
 					cmServer.Delete(*id)
-					newConn.Close()
+					_ = tunConnHandler.Close()
 					errStop = true
 				}
 
@@ -341,8 +364,14 @@ func run(wsConn *websocket.Conn) {
 				if ip == "" || !isSameSubnet(dstIP, ip) || ip == dstIP {
 					continue
 				}
-				if len(data) > 9 && data[9] == IPProtoTCP {
+				if len(data) <= 9 {
+					continue
+				}
+				if data[9] == 6 {
 					c.SendBytes(data)
+					continue
+				}
+				if data[9] != 17 && data[9] != 1 && data[9] != 2 {
 					continue
 				}
 				p := packet{dstIP: dstIP, data: append([]byte(nil), data...)}
@@ -530,7 +559,11 @@ func run(wsConn *websocket.Conn) {
 					}
 					payload := buf[2 : 2+plen]
 
-					WriteBytesWithLenToTun(payload, plen)
+					if _, err := WriteBytesWithLenToTun(payload, plen); err != nil {
+						log.Println("[ERROR] 写入 TUN 失败:", err)
+					} else if debug {
+						log.Printf("[DEBUG] 写入 TUN, len=%d", plen)
+					}
 
 					buf = buf[2+plen:]
 				}
@@ -540,31 +573,47 @@ func run(wsConn *websocket.Conn) {
 				}
 				data = data[4:]
 				id := decodeEndpointID(data)
-				localConn, ok := cmClient.Get(*id)
+				localConnHandler, ok := cmClient.Get(*id)
 				if ok {
 					if debug {
 						log.Println("存在conn继续write")
 					}
-					_, err := localConn.Write(data[12:])
-					if err != nil {
-						cmClient.Delete(*id)
-						continue
-					}
+					localConnHandler.Write(data[12:])
+					continue
 				} else {
 					if debug {
 						log.Println("dial: " + ip + ":" + fmt.Sprintf("%d", id.LocalPort))
 					}
-					localConn, err = net.Dial("tcp", ip+":"+fmt.Sprintf("%d", id.LocalPort))
+					localConn, err := net.Dial("tcp", ip+":"+fmt.Sprintf("%d", id.LocalPort))
 					if err != nil {
 						log.Println("dial err:", err)
 						continue
 					}
-					_, err := localConn.Write(data[12:])
+					_, err = localConn.Write(data[12:])
 					if err != nil {
 						log.Println("write err:", err)
+						_ = localConn.Close()
 						continue
 					}
-					cmClient.Set(*id, localConn)
+					localConnHandler = NewConnHandler(localConn, 1024, 0, maxLimit, func(cw *ConnHandler, n int, err error) {
+						if err != nil {
+							wg.Add(1)
+							go func() {
+								defer wg.Done()
+								cmClient.Delete(*id)
+								_ = cw.Close()
+								serverData := make([]byte, 17)
+								serverData[0] = 4
+								copy(serverData[1:5], id.RemoteAddress.AsSlice())
+								copy(serverData[5:9], id.LocalAddress.AsSlice())
+								copy(serverData[9:13], id.RemoteAddress.AsSlice())
+								binary.BigEndian.PutUint16(serverData[13:15], id.LocalPort)
+								binary.BigEndian.PutUint16(serverData[15:17], id.RemotePort)
+								writeMessageAsync(wsConn, websocket.BinaryMessage, serverData)
+							}()
+						}
+					})
+					cmClient.Set(*id, localConnHandler)
 					wg.Add(1)
 					go func() {
 						defer wg.Done()
@@ -574,14 +623,14 @@ func run(wsConn *websocket.Conn) {
 							select {
 							case <-stop:
 								cmClient.Delete(*id)
-								localConn.Close()
-								log.Println("[INFO] TCP Forwarder goroutine 退出")
+								_ = localConnHandler.Close()
+								log.Println("[INFO] Local TCP Forwarder goroutine 退出")
 								closeAll(wsConn)
 								return
 							default:
 							}
 							if errStop {
-								serverData := make([]byte, 17+len(data))
+								serverData := make([]byte, 17)
 								serverData[0] = 4
 								copy(serverData[1:5], id.RemoteAddress.AsSlice())
 								copy(serverData[5:9], id.LocalAddress.AsSlice())
@@ -591,19 +640,19 @@ func run(wsConn *websocket.Conn) {
 								writeMessageAsync(wsConn, websocket.BinaryMessage, serverData)
 								return
 							}
-							n, err := localConn.Read(buf)
+							n, err := localConnHandler.Read(buf)
 							if err != nil {
 								if debug {
 									log.Println("Dial Read error:", err)
 								}
 								cmClient.Delete(*id)
-								localConn.Close()
+								_ = localConnHandler.Close()
 								errStop = true
 							}
 
 							data := buf[:n]
 							if debug {
-								log.Println("dial read:", len(data))
+								//log.Println("dial read:", len(data))
 							}
 
 							serverData := make([]byte, 17+len(data))
@@ -621,33 +670,16 @@ func run(wsConn *websocket.Conn) {
 				}
 			} else if msgType == 3 {
 				if debug {
-					log.Println("收到TCP数据返回")
+					//log.Println("收到TCP数据返回")
 				}
 				data = data[4:]
 				id := decodeEndpointID(data)
-				tunConn, ok := cmServer.Get(*id)
+				tunConnHandler, ok := cmServer.Get(*id)
 				if ok {
 					if debug {
-						log.Println("收到TCP数据返回，数据写入")
+						//log.Println("收到TCP数据返回，数据写入")
 					}
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						_, err := tunConn.Write(data[12:])
-						if err != nil {
-							if debug {
-								log.Println("数据写入失败")
-							}
-							serverData := make([]byte, 17+len(data))
-							serverData[0] = 4
-							copy(serverData[1:5], id.LocalAddress.AsSlice())
-							copy(serverData[5:9], id.LocalAddress.AsSlice())
-							copy(serverData[9:13], id.RemoteAddress.AsSlice())
-							binary.BigEndian.PutUint16(serverData[13:15], id.LocalPort)
-							binary.BigEndian.PutUint16(serverData[15:17], id.RemotePort)
-							writeMessageAsync(wsConn, websocket.BinaryMessage, serverData)
-						}
-					}()
+					tunConnHandler.Write(data[12:])
 				}
 			} else if msgType == 4 {
 				if debug {
@@ -751,7 +783,7 @@ var (
 	wsOnce       sync.Once
 )
 
-func initWriter(wsConn *websocket.Conn) {
+func initWsWriter(wsConn *websocket.Conn) {
 	wsWriteQueue = make(chan msg, 1024)
 
 	wg.Add(1)
@@ -779,45 +811,81 @@ func initWriter(wsConn *websocket.Conn) {
 			}
 		}
 	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		currentLimit := maxLimit
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				queueUsage := float64(len(wsWriteQueue)) / float64(cap(wsWriteQueue))
+
+				needToSet := false
+				// 调整策略
+				if queueUsage > 0.8 {
+					currentLimit -= 1 << 18 //256KB/s
+					if currentLimit < 1 {
+						currentLimit = 1
+					}
+					needToSet = true
+				} else if queueUsage < 0.01 && currentLimit != maxLimit {
+					currentLimit += 1 << 13 //8KB/s
+					if currentLimit > maxLimit {
+						currentLimit = maxLimit
+					}
+					needToSet = true
+				}
+
+				if needToSet {
+					for _, id := range cmClient.Keys() {
+						conn, ok := cmClient.Get(id)
+						if !ok {
+							continue
+						}
+						conn.SetReadLimit(currentLimit)
+						if debug {
+							log.Printf("[Limiter] set client limit=%d", currentLimit)
+						}
+					}
+					for _, id := range cmServer.Keys() {
+						conn, ok := cmServer.Get(id)
+						if !ok {
+							continue
+						}
+						conn.SetReadLimit(currentLimit)
+					}
+				}
+				if debug {
+					log.Printf("[Limiter] queueUsage=%.2f, newLimit=%d", queueUsage, currentLimit)
+				}
+			}
+		}
+	}()
 }
 
 func writeMessageAsync(wsConn *websocket.Conn, messageType int, data []byte) {
-	/*wg.Add(1)
-	go func() {
-		defer wg.Done()
-		wsMu.Lock()
-		defer wsMu.Unlock()
-		if err := wsConn.WriteMessage(messageType, data); err != nil {
-			select {
-			case <-stop:
-				log.Println("[INFO] 异步发送 goroutine 退出")
-				closeAll(wsConn)
-				return
-			default:
-			}
-			log.Println("[ERROR] 发送失败:", err)
-			stopOnce.Do(func() { close(stop) })
-		}
-	}()*/
-	wsOnce.Do(func() { initWriter(wsConn) })
-	wsWriteQueue <- msg{typ: messageType, data: data}
+	closeLocker.Lock()
+	defer closeLocker.Unlock()
+	wsOnce.Do(func() { initWsWriter(wsConn) })
+	if !allClosed {
+		wsWriteQueue <- msg{typ: messageType, data: data}
+	}
 }
 
 func WriteBytesToTun(payload []byte) (int, error) {
-	plen := len(payload)
-	out := make([]byte, tunPacketOffset+plen)
+	out := make([]byte, tunPacketOffset+len(payload))
 	copy(out[tunPacketOffset:], payload)
-
 	return dev.Write([][]byte{out}, tunPacketOffset)
 }
 
-func WriteBytesWithLenToTun(payload []byte, plen int) {
+func WriteBytesWithLenToTun(payload []byte, plen int) (int, error) {
 	out := make([]byte, tunPacketOffset+plen)
 	copy(out[tunPacketOffset:], payload)
-
-	if _, err := dev.Write([][]byte{out}, tunPacketOffset); err != nil {
-		log.Println("[ERROR] 写入 TUN 失败:", err)
-	} else if debug {
-		log.Printf("[DEBUG] 写入 TUN, len=%d", plen)
-	}
+	return dev.Write([][]byte{out}, tunPacketOffset)
 }
