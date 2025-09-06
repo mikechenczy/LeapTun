@@ -835,7 +835,7 @@ func initWsWriter(wsConn *websocket.Conn) {
 					}
 					needToSet = true
 				} else if queueUsage < 0.01 && currentLimit != maxLimit {
-					currentLimit += 1 << 13 //8KB/s
+					currentLimit += 1 << 16 //64KB/s
 					if currentLimit > maxLimit {
 						currentLimit = maxLimit
 					}
