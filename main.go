@@ -131,24 +131,25 @@ func main() {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
 				log.Println("[WARN] 读取认证消息失败:", err)
-				conn.Close()
-				time.Sleep(10 * time.Second)
+				_ = conn.Close()
+				time.Sleep(5 * time.Second)
 				continue
 			}
 
 			var resp map[string]interface{}
 			if err := json.Unmarshal(message, &resp); err != nil {
 				log.Println("[WARN] 解析认证消息失败:", err)
-				conn.Close()
-				time.Sleep(10 * time.Second)
+				_ = conn.Close()
+				time.Sleep(5 * time.Second)
 				continue
 			}
 
 			log.Println(resp["message"])
 			if code, ok := resp["code"].(float64); ok && code != 0 {
-				log.Println("[ERROR] 5s后程序退出")
+				log.Println("[WARN] 认证失败，5s后重连:", err)
+				_ = conn.Close()
 				time.Sleep(5 * time.Second)
-				os.Exit(0)
+				continue
 			}
 
 			// 调用核心逻辑 run(conn)，断开后自动重连

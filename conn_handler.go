@@ -13,7 +13,7 @@ type ConnHandler struct {
 	conn net.Conn
 
 	queue chan []byte
-	wg    sync.WaitGroup
+	//wg    sync.WaitGroup
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -40,13 +40,13 @@ func NewConnHandler(conn net.Conn, queueSize int, writeBps, readBps int, onWrite
 		cw.readLimiter = rate.NewLimiter(rate.Limit(readBps), readBps)
 	}
 
-	cw.wg.Add(1)
+	//cw.wg.Add(1)
 	go cw.writer()
 	return cw
 }
 
 func (cw *ConnHandler) writer() {
-	defer cw.wg.Done()
+	//defer cw.wg.Done()
 	for {
 		select {
 		case data, ok := <-cw.queue:
@@ -56,7 +56,10 @@ func (cw *ConnHandler) writer() {
 
 			// 写限速
 			if cw.getWriteLimiter() != nil {
-				_ = cw.getWriteLimiter().WaitN(context.Background(), len(data))
+				err := cw.getWriteLimiter().WaitN(context.Background(), len(data))
+				if err != nil {
+					return
+				}
 			}
 
 			_ = cw.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -80,16 +83,13 @@ func (cw *ConnHandler) Write(data []byte) {
 
 // Read 限速
 func (cw *ConnHandler) Read(p []byte) (int, error) {
-	n, err := cw.conn.Read(p)
-	if err != nil {
-		return n, err
-	}
-
-	// 消耗读令牌，阻塞直至可读
 	if cw.getReadLimiter() != nil {
-		_ = cw.getReadLimiter().WaitN(context.Background(), n)
+		err := cw.getReadLimiter().WaitN(context.Background(), cap(p))
+		if err != nil {
+			return 0, err
+		}
 	}
-	return n, nil
+	return cw.conn.Read(p)
 }
 
 func (cw *ConnHandler) Close() error {
@@ -97,7 +97,7 @@ func (cw *ConnHandler) Close() error {
 		close(cw.queue)
 		close(cw.closed)
 	})
-	cw.wg.Wait()
+	//cw.wg.Wait()
 	return cw.conn.Close()
 }
 
