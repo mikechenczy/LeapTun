@@ -1,5 +1,14 @@
 del /Q ".\app.syso"
 SET CGO_ENABLED=0
+SET GOOS=android
+SET GOARCH=amd64
+go build -a -trimpath -asmflags "-s -w" -ldflags "-s -w -buildid=" -o "build\android\LeapTun_amd64"
+SET GOOS=android
+SET GOARCH=arm
+go build -a -trimpath -asmflags "-s -w" -ldflags "-s -w -buildid=" -o "build\android\LeapTun_arm"
+SET GOOS=android
+SET GOARCH=arm64
+go build -a -trimpath -asmflags "-s -w" -ldflags "-s -w -buildid=" -o "build\android\LeapTun_arm64"
 SET GOOS=darwin
 SET GOARCH=amd64
 go build -a -trimpath -asmflags "-s -w" -ldflags "-s -w -buildid=" -o "build\darwin\LeapTun_amd64"
