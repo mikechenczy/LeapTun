@@ -361,7 +361,7 @@ func run(wsConn *websocket.Conn) {
 			for i := 0; i < n; i++ {
 				data := bufs[i][tunPacketOffset : tunPacketOffset+sizes[i]]
 				dstIP := getDstIP(data)
-				if ip == "" || !isSameSubnet(dstIP, ip) || ip == dstIP {
+				if dstIP == "" || ip == "" || !isSameSubnet(dstIP, ip) || ip == dstIP {
 					continue
 				}
 				if len(data) <= 9 {
