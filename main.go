@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -77,8 +79,32 @@ func main() {
 				time.Sleep(5 * time.Second)
 				continue
 			}
-			// 创建 HTTP 客户端（支持重定向）
+
+			// 自定义 DNS 服务器，比如 1.1.1.1
+			customResolver := &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+					d := net.Dialer{
+						Timeout: time.Second * 3,
+					}
+					return d.DialContext(ctx, "udp", "1.1.1.1:53")
+				},
+			}
+
+			// 自定义 Transport
+			dialer := &net.Dialer{
+				Timeout:   10 * time.Second,
+				Resolver:  customResolver, // 用上面的自定义解析器
+				KeepAlive: 10 * time.Second,
+			}
+
+			transport := &http.Transport{
+				DialContext: dialer.DialContext,
+			}
+
 			client := &http.Client{
+				Transport: transport,
+				Timeout:   15 * time.Second,
 				CheckRedirect: func(req *http.Request, via []*http.Request) error {
 					return http.ErrUseLastResponse
 				},

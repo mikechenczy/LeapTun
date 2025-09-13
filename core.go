@@ -243,6 +243,7 @@ func run(wsConn *websocket.Conn) {
 	stop = make(chan struct{})
 	stopOnce = sync.Once{}
 	wsOnce = sync.Once{}
+	wsWriteQueue = make(chan msg, 1024)
 
 	type packet struct {
 		dstIP string
@@ -784,8 +785,6 @@ var (
 )
 
 func initWsWriter(wsConn *websocket.Conn) {
-	wsWriteQueue = make(chan msg, 1024)
-
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
